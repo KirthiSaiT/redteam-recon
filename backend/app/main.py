@@ -1,0 +1,207 @@
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+import sys
+
+# Fix for Playwright on Windows
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+from uuid import uuid4
+from datetime import datetime
+from typing import Dict, List
+
+from .schemas import ScanRequest, ScanResult, SubdomainResult, PortResult
+from .services.subdomain import SubdomainService
+from .services.port_scan import PortScanService
+from .services.osint import OsintService
+from .services.fuzzing import FuzzingService
+from .services.visual_recon import VisualReconService
+from .database import scan_collection
+
+import asyncio
+
+app = FastAPI(title="Red Team Recon API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory storage for scan results (for quick access before DB persistence)
+SCAN_RESULTS: Dict[str, dict] = {}
+
+async def run_scan_task(scan_id: str, domain: str):
+    """
+    Background task to run ALL recon services and update MongoDB.
+    """
+    print(f"Starting scan for {domain} (ID: {scan_id})")
+    try:
+        # Update Status to Running (In-Memory)
+        if scan_id in SCAN_RESULTS:
+            SCAN_RESULTS[scan_id]["status"] = "running"
+        
+        # Update DB (Best Effort)
+        try:
+             await scan_collection.update_one({"id": scan_id}, {"$set": {"status": "running"}})
+        except: pass
+
+        # 1. Subdomain Discovery
+        print("Running Subdomain Discovery...")
+        passive_subs = SubdomainService.get_subdomains_crtsh(domain)
+        # Fallback if passive fails: use the domain itself
+        if not passive_subs:
+            print("Passive subdomain discovery failed or returned 0. Using main domain only.")
+            all_subs = [domain]
+        else:
+            all_subs = list(set(passive_subs))
+
+        sub_result = SubdomainResult(subdomains=all_subs, count=len(all_subs))
+        
+        # 2. Port Scanning
+        print("Running Port Scan...")
+        import socket
+        ports_list = []
+        try:
+            # Resolve main domain
+            ip = socket.gethostbyname(domain)
+            print(f"Accquired IP: {ip}")
+            open_ports = PortScanService.scan_common_ports(ip)
+            print(f"Found ports: {open_ports}")
+            port_result = PortResult(ip=ip, ports=open_ports)
+            ports_list = [port_result]
+        except Exception as e:
+            print(f"Port scan failed: {e}")
+
+        # 3. OSINT / Tech Stack & WAF
+        print("Running OSINT...")
+        try:
+            tech_stack = OsintService.get_tech_stack(domain)
+        except:
+            tech_stack = []
+
+        # 4. Directory Fuzzing relative to domain
+        print("Running Directory Fuzzing...")
+        try:
+           directories = FuzzingService.brute_force_directories(domain)
+        except:
+            directories = []
+
+        # 5. Visual Recon (Screenshots)
+        print("Running Visual Recon...")
+        screenshots = {}
+        try:
+            # Screenshot main domain + top 4 subdomains
+            targets_for_screen = [domain] + [s for s in all_subs if s != domain][:4]
+            screenshots = await VisualReconService.take_screenshots(targets_for_screen)
+        except Exception as e:
+             print(f"Visual recon failed: {e}")
+
+        # 6. Vuln Scan (Mock for now or integrate searching)
+        # Simple version check mock
+        vulns = []
+        for tech in tech_stack:
+            if "Apache" in tech:
+                vulns.append("Apache: Check for Path Traversal (CVE-2021-41773)")
+            if "PHP" in tech:
+                 vulns.append("PHP: Check for Info Disclosure")
+
+        # Update Result in DB
+        result_update = {
+            "status": "completed",
+            "subdomains": sub_result.dict(),
+            "ports": [p.dict() for p in ports_list],
+            "technologies": tech_stack,
+            "directories": directories,
+            "screenshots": screenshots,
+            "vulnerabilities": vulns
+        }
+        
+        # Save to In-Memory
+        if scan_id in SCAN_RESULTS:
+            SCAN_RESULTS[scan_id].update(result_update)
+
+        # Save to DB (Best Effort)
+        try:
+            await scan_collection.update_one(
+                {"id": scan_id},
+                {"$set": result_update}
+            )
+        except Exception as e:
+            print(f"DB Final Update Failed: {e}")
+            
+        print(f"Scan {scan_id} completed.")
+
+    except Exception as e:
+        print(f"Scan failed: {e}")
+        # Failure update
+        if scan_id in SCAN_RESULTS:
+             SCAN_RESULTS[scan_id]["status"] = "failed"
+        try:
+            await scan_collection.update_one(
+                {"id": scan_id},
+                {"$set": {"status": "failed"}}
+            )
+        except: pass
+
+@app.get("/")
+def read_root():
+    return {"message": "Recon API is running"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.post("/api/scan", response_model=ScanResult)
+async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
+    scan_id = str(uuid4())
+    new_scan = ScanResult(
+        id=scan_id,
+        domain=request.domain,
+        status="pending",
+        timestamp=datetime.now()
+    )
+    
+    # Save to In-Memory
+    SCAN_RESULTS[scan_id] = new_scan.dict()
+
+    # Save to MongoDB (Best Effort)
+    try:
+        await scan_collection.insert_one(new_scan.dict())
+    except Exception as e:
+        print(f"DB Write Failed: {e}")
+    
+    background_tasks.add_task(run_scan_task, scan_id, request.domain)
+    return new_scan
+
+@app.get("/api/scan/{scan_id}", response_model=ScanResult)
+async def get_scan_result(scan_id: str):
+    # Try DB first
+    try:
+        scan = await scan_collection.find_one({"id": scan_id})
+        if scan:
+            return ScanResult(**scan)
+    except Exception as e:
+        print(f"DB Read Failed: {e}. Checking in-memory.")
+    
+    # Fallback to in-memory
+    if scan_id in SCAN_RESULTS:
+        return ScanResult(**SCAN_RESULTS[scan_id])
+        
+    raise HTTPException(status_code=404, detail="Scan not found")
+
+@app.get("/api/scans", response_model=List[ScanResult])
+async def get_scan_history():
+    try:
+        cursor = scan_collection.find({}).sort("timestamp", -1)
+        scans = []
+        async for document in cursor:
+            document.pop("_id", None) # Remove MongoDB's _id field
+            scans.append(document)
+        return [ScanResult(**scan) for scan in scans]
+    except Exception as e:
+        print(f"DB List Failed: {e}. Returning in-memory.")
+        return [ScanResult(**scan) for scan in SCAN_RESULTS.values()]
